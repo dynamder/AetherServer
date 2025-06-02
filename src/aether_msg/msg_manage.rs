@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use serde::{Serialize,Deserialize};
 use sqlite::Sqlite;
 use sqlx::migrate::{Migrate, MigrateDatabase};
@@ -12,8 +13,8 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MessageChunk {
-    msgs: HashMap<String, Arc<Message>>,
+struct MessageChunk {
+    msgs: DashMap<String, Arc<Message>>,
     sorted_msgs: Vec<Arc<Message>>,
     size: usize,
     id: String,
@@ -22,7 +23,7 @@ pub struct MessageChunk {
 impl MessageChunk {
     pub fn new(chunk_size: usize) -> Self {
         Self {
-            msgs: HashMap::with_capacity(chunk_size),
+            msgs: DashMap::with_capacity(chunk_size),
             sorted_msgs: Vec::with_capacity(chunk_size),
             size: chunk_size,
             id: Uuid::new_v4().to_string(),
@@ -30,7 +31,7 @@ impl MessageChunk {
     }
     pub fn from_msgs(msgs: Vec<Arc<Message>>) -> Self {
         let mut chunk = Self {
-            msgs: HashMap::with_capacity(msgs.len()),
+            msgs: DashMap::with_capacity(msgs.len()),
             sorted_msgs: Vec::with_capacity(msgs.len()),
             size: msgs.len(),
             id: Uuid::new_v4().to_string(),
@@ -75,10 +76,12 @@ impl MessageChunk {
        Ok(())
     }
 }
-pub struct MessageChunkLoader {
+#[derive(Debug)]
+struct MessageChunkLoader {
     pool: Arc<SqlitePool>,
 }
-pub struct MessageWriter {
+#[derive(Debug)]
+struct MessageWriter {
     pool: Arc<SqlitePool>,
     cache: Vec<Arc<Message>>, // 缓存消息，避免频繁访问数据库
 }
@@ -98,6 +101,15 @@ CREATE TABLE IF NOT EXISTS sessions (
                                         id TEXT PRIMARY KEY,
                                         created_at INTEGER NOT NULL,
                                         last_message_at INTEGER NOT NULL
+);
+
+-- 会话参与者表
+CREATE TABLE IF NOT EXISTS session_participants (
+                                                    session_id TEXT NOT NULL,
+                                                    participant_id TEXT NOT NULL,
+                                                    PRIMARY KEY (session_id, participant_id),
+                                                    FOREIGN KEY (session_id) REFERENCES sessions(id),
+                                                    FOREIGN KEY (participant_id) REFERENCES users(id)
 );
 
 -- 消息表
@@ -123,6 +135,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_references ON messages(referenced_msg_id)
     WHERE referenced_msg_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_users_id ON users(id);
+CREATE INDEX IF NOT EXISTS idx_session_participants_session ON session_participants(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_participants_participant ON session_participants(participant_id);
+
 "#;
 pub async fn init_db(db_path: &str) -> Result<SqlitePool, sqlx::Error> {
     let mut need_migration: bool = false;
@@ -310,11 +325,12 @@ impl MessageWriter {
         Ok(())
     }
 }
+#[derive(Debug)]
 pub struct MessageSequence {
     session_id: String,
-    sequence: VecDeque<Arc<MessageChunk>>,
+    sequence: RwLock<VecDeque<Arc<RwLock<MessageChunk>>>>,
     last_prev_chunk_id: String,
-    id_index: DashMap<String, Arc<MessageChunk>>,
+    id_index: DashMap<String, Arc<RwLock<MessageChunk>>>,
 
     loader: Arc<MessageChunkLoader>,
     writer: Arc<MessageWriter>,
@@ -325,7 +341,7 @@ impl MessageSequence {
     pub fn new(session_id: String, pool: Arc<SqlitePool>, append_chunk_size: usize,init_capacity: usize) ->  Self {
         Self {
             session_id,
-            sequence: VecDeque::with_capacity(init_capacity),
+            sequence: RwLock::new(VecDeque::with_capacity(init_capacity)),
             last_prev_chunk_id: String::new(),
             id_index: DashMap::new(),
             loader: Arc::new(MessageChunkLoader::new(pool.clone())),
@@ -333,95 +349,121 @@ impl MessageSequence {
             append_chunk_size
         }
     }
-    pub fn create_index(&mut self, chunk: &Arc<MessageChunk>) {
-        for msg in chunk.get_sorted_msgs() {
-            self.id_index.insert(msg.inner().id.clone(), Arc::clone(chunk));
+    pub async fn create_index(&mut self, chunk: Arc<RwLock<MessageChunk>>) -> Result<(),Error>{
+        let inner_chunk = chunk.write().await;
+        for msg in inner_chunk.get_sorted_msgs() {
+            self.id_index.insert(msg.inner().id.clone(), Arc::clone(&chunk));
         }
+        Ok(())
     }
-    pub fn push_prev(&mut self, chunk: Arc<MessageChunk>) {
-        self.create_index(&chunk);
-        self.last_prev_chunk_id = chunk.id.clone();
-        self.sequence.push_front(chunk);
-
+    pub async fn push_prev(&mut self, chunk: Arc<RwLock<MessageChunk>>) -> Result<(),Error> {
+        self.create_index(Arc::clone(&chunk)).await;
+        let inner_chunk = chunk.read().await;
+        self.last_prev_chunk_id = inner_chunk.id.clone();
+        drop(inner_chunk);
+        let mut inner_seq = self.sequence.write().await;
+        inner_seq.push_front(chunk);
+        Ok(())
     }
-    pub fn new_chunk(&mut self) {
-        self.sequence.push_back(Arc::new(MessageChunk::new(self.append_chunk_size)));
+    pub async fn new_chunk(&mut self) -> Result<(),Error>{
+        let mut inner_seq = self.sequence.write().await;
+        inner_seq.push_back(Arc::new(RwLock::new(MessageChunk::new(self.append_chunk_size))));
+        Ok(())
     }
-    pub fn get_msg(&self, msg_id: &str) -> Option<Arc<Message>> {
+    pub async fn get_msg(&self, msg_id: &str) -> Option<Arc<Message>> {
         if let Some(chunk) = self.id_index.get(msg_id) {
-            return chunk.value().get_msg(msg_id);
+            let inner_chunk = chunk.read().await;
+            return inner_chunk.get_msg(msg_id);
         }
         None
     }
     pub fn clean_index(&mut self, retained_ids: &HashSet<String>) { //CAUTION: potential memory leak
         self.id_index.retain(|id, _| retained_ids.contains(id));
     }
-    pub fn unload_prev_chunk(&mut self) {
-        if !self.sequence.is_empty() {
-            self.sequence.pop_front();
-            if let Some(chunk) = self.sequence.front() {
-                self.last_prev_chunk_id = chunk.id.clone();
+    pub async fn unload_prev_chunk(&mut self) {
+        let mut inner_seq = self.sequence.write().await;
+        if !inner_seq.is_empty() {
+            inner_seq.pop_front();
+            if let Some(chunk) = inner_seq.front() {
+                let inner_chunk = chunk.read().await;
+                self.last_prev_chunk_id = inner_chunk.id.clone();
             }else {
                 self.last_prev_chunk_id = String::new();
             }
         }
         //we don't clean the index here, batch it later
     }
-    pub async fn load_prev(&mut self, timestamp_offset: u64) -> Result<(), Error> {
-        if !self.sequence.is_empty() {
-            let chunk = self.sequence.front().unwrap();
-            match (*chunk.get_sorted_msgs()).get(0) {
-                Some(msg) => {
-                    let last_timestamp = msg.inner().timestamp;
-                    let chunk =  Arc::new(self.loader.load_chunk(
+    pub async fn load_prev(&mut self, timestamp_offset: u64) -> Result<(), Error> { //TODO: need to test again
+        let inner_seq = self.sequence.read().await;
+        if !inner_seq.is_empty() {
+            let chunk = inner_seq.front().unwrap();
+            let inner_chunk = chunk.read().await;
+            let last_timestamp = match inner_chunk.get_sorted_msgs().get(0) {
+                Some(msg) => msg.inner().timestamp,
+                None => return Err(anyhow!("empty chunk, continuous timestamp read failed, can't load prev messages.")),
+            };
+            drop(inner_chunk);
+            drop(inner_seq);
+
+            let chunk =  Arc::new(
+                RwLock::new(
+                    self.loader.load_chunk(
                         self.session_id.as_str(),
                         last_timestamp-timestamp_offset,
                         last_timestamp,
-                    ).await?);
-                    self.create_index(&chunk);
-                    self.push_prev(
-                       chunk
-                    );
-                    Ok(())
-                },
-                None => {Err(anyhow!("empty chunk, continuous timestamp read failed, can't load prev messages."))}
-            }
+                    ).await?
+                )
+            );
+            self.create_index(Arc::clone(&chunk)).await?;
+            self.push_prev(chunk).await?;
+            Ok(())
         }else {
+            drop(inner_seq);
             let now = Utc::now().timestamp() as u64;
             let chunk = Arc::new(
-                self.loader.load_chunk(
-                    self.session_id.as_str(),
-                    now - timestamp_offset,
-                    now
-                ).await?
+                RwLock::new(
+                    self.loader.load_chunk(
+                        self.session_id.as_str(),
+                        now - timestamp_offset,
+                        now
+                    ).await?
+                )
             );
-            self.create_index(&chunk);
-            self.push_prev(
-                chunk
-            );
+            self.create_index(Arc::clone(&chunk)).await?;
+            self.push_prev(chunk).await?;
             Ok(())
         }
     }
     pub async fn write_message(&mut self, msg: Arc<Message>) -> Result<(),Error>{
-        if let Some(chunk) = self.sequence.back() {
-            if chunk.is_full() {
-                self.new_chunk();
+        let mut inner_seq = self.sequence.write().await;
+        let mut need_new: bool = false;
+        if let Some(chunk) = inner_seq.back() {
+            let inner_chunk = chunk.read().await;
+            if inner_chunk.is_full() {
+                need_new = true;
             }
         }else {
-            self.new_chunk();
+            need_new = true;
         }
-
-        if let Some(chunk) = Arc::get_mut(self.sequence.back_mut().expect("chunk should exist")) {
-            chunk.push_msg(Arc::clone(&msg))?;
+        
+        if need_new {
+            inner_seq.push_back(Arc::new(RwLock::new(MessageChunk::new(self.append_chunk_size))));
+        }
+        
+        if let Some(chunk) = inner_seq.back_mut() {
+            let mut inner_chunk = chunk.write().await;
+            inner_chunk.push_msg(Arc::clone(&msg))?;
         }
         self.writer.write(Arc::clone(&msg)).await?;
-        self.id_index.insert(msg.inner().id.clone(), Arc::clone(self.sequence.back().expect("chunk should exist")));
+        self.id_index.insert(msg.inner().id.clone(), Arc::clone(inner_seq.back().expect("chunk should exist")));
         Ok(())
     }
-    pub fn get_msg_sequence(&self) -> Vec<Arc<Message>> {
+    pub async fn get_msg_sequence(&self) -> Vec<Arc<Message>> {
+        let inner_seq = self.sequence.read().await;
         let mut msgs: Vec<Arc<Message>> = Vec::new();
-        for chunk in self.sequence.iter() {
-           msgs.extend_from_slice(chunk.get_sorted_msgs())
+        for chunk in inner_seq.iter() {
+            let inner_chunk = chunk.read().await;
+            msgs.extend_from_slice(inner_chunk.get_sorted_msgs());
         }
         msgs
     }
@@ -760,7 +802,7 @@ mod tests {
     }
 
 }
-
+//TODO: try not to use Arc to wrap a MessageChunk as they are private and invisible to outer, thus rarely shared ownership
 
 /////
 #[cfg(test)]
@@ -857,7 +899,7 @@ mod tests_sequence {
         let sequence = MessageSequence::new("session_1".to_string(), Arc::new(pool.clone()), 2, 10);
 
         // Check initial state
-        assert!(sequence.sequence.is_empty());
+        assert!(sequence.sequence.read().await.is_empty());
         assert_eq!(sequence.last_prev_chunk_id, String::new());
         assert!(sequence.id_index.is_empty());
         cleanup_db(&pool).await;
@@ -899,8 +941,8 @@ mod tests_sequence {
         }
 
         // Check the content of the retrieved messages
-        let retrieved_messages = sequence.get_msg_sequence();
-        assert_eq!(retrieved_messages.len(), 2);
+        let retrieved_messages = sequence.get_msg_sequence().await;
+        assert_eq!(retrieved_messages.len(), 2,"{:?}，\ninitial {:?}\nSequence {:?}", &retrieved_messages,&messages,&sequence);
         assert_eq!(retrieved_messages[0].inner().content, MsgContent::Text("Hello".to_string()));
         assert_eq!(retrieved_messages[1].inner().content, MsgContent::Text("World".to_string()));
         cleanup_db(&pool).await;
@@ -931,7 +973,7 @@ mod tests_sequence {
         sequence.write_message(Arc::new(messages[0].clone())).await.unwrap();
 
         // Retrieve a specific message by ID
-        let msg = sequence.get_msg("msg999999966666").unwrap();
+        let msg = sequence.get_msg("msg999999966666").await.unwrap();
         assert_eq!(msg.inner().content, MsgContent::Text("Hello".to_string()));
         cleanup_db(&pool).await;
     }
@@ -968,14 +1010,14 @@ mod tests_sequence {
 
         // Write messages to the sequence
         for msg in &messages {
-            sequence.write_message(Arc::new(msg.clone())).await.unwrap();
+            sequence.write_message(Arc::new(msg.clone())).await.unwrap();//TODO: the second message doesn't write correctly
         }
 
         // Load previous chunks
         sequence.load_prev(1000).await.unwrap();
 
         // Check the content of the retrieved messages
-        let retrieved_messages = sequence.get_msg_sequence();
+        let retrieved_messages = sequence.get_msg_sequence().await;
         assert_eq!(retrieved_messages.len(), 2);
         assert_eq!(retrieved_messages[0].inner().content, MsgContent::Text("Hello".to_string()));
         assert_eq!(retrieved_messages[1].inner().content, MsgContent::Text("World".to_string()));
@@ -985,7 +1027,7 @@ mod tests_sequence {
     #[tokio::test]
     async fn test_message_sequence_unload_prev_chunk() {
         let pool = setup_db().await;
-        
+
 
         // Prepare messages
         let messages = vec![
@@ -1018,13 +1060,13 @@ mod tests_sequence {
         }
 
         // Unload previous chunks
-        sequence.unload_prev_chunk();
+        sequence.unload_prev_chunk().await;
 
         // Check the content of the retrieved messages
-        let retrieved_messages = sequence.get_msg_sequence();
+        let retrieved_messages = sequence.get_msg_sequence().await;
         assert_eq!(retrieved_messages.len(), 1);
         assert_eq!(retrieved_messages[0].inner().content, MsgContent::Text("World".to_string()));
-       
+
         cleanup_db(&pool).await;
     }
 }
